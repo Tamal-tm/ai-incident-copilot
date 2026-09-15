@@ -3,3 +3,6 @@ lambda-deploy.zip
 .env
 __pycache__/
 *.pyc
+infra/terraform.tfvars
+infra/.terraform/
+infra/*.tfstate*
