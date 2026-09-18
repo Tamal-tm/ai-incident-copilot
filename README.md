@@ -1,62 +1,103 @@
-# Self-Healing Observable Platform
+\`\`\`mermaid
+flowchart LR
+    AM["Alertmanager<br/>(receiver: ai-copilot)"] -->|POST /alert<br/>webhook_configs| APIGW["API Gateway HTTP API<br/>>
+    APIGW --> LAMBDA["Lambda (container image, ECR)<br/>handler.py — filters status=='firing'"]
+    LAMBDA -->|similarity_search k=2| FAISS["FAISS index<br/>baked into image at build time"]
+    LAMBDA -->|prompt + runbook context,<br/>retry x3 w/ backoff| GEMINI["Gemini 2.5/3.6 Flash"]
+    GEMINI -->|diagnosis text| LAMBDA
+    LAMBDA -->|post message| SLACK2["Slack #alerts"]
+\`\`\`
 
-One-line pitch: Designed and operated a GitOps-deployed microservice
-platform on AWS with full observability, defined SLOs, and chaos-tested
-incident response.
 
-## Architecture
-![Architecture diagram](./docs/architecture.png)
+# Prerequisites: AWS account, Terraform >= 1.5, Docker 23+ (BuildKit),
+# AWS CLI, Gemini API key (Google AI Studio free tier), Slack incoming webhook URL
 
-## What's in here
-- Terraform-provisioned AWS infra (VPC, EC2, Elastic IP, S3 remote state)
-- k3s single-node Kubernetes cluster
-- ArgoCD GitOps deployment (3-repo split: infra / app / manifests)
-- Two-service demo app (Node/Express + Python/Flask) with Prometheus instrumentation
-- kube-prometheus-stack (Prometheus, Grafana, Alertmanager) + Loki/Promtail
-- A defined SLO with error-budget burn-rate alerting to Slack
-- Chaos-tested: pod-kill and CPU-stress experiments with a full blameless postmortem
+# 1. Build the runbook index (one-time, offline)
+cd ai-incident-copilot
+python build_index.py   # embeds runbooks/ into a local FAISS index at faiss_index/
 
-## SLO
-99% of requests succeed with <300ms latency, rolling 7-day window
-→ full detail in [SLO.md](./SLO.md)
+# 2. Build and push the Lambda image
+# --provenance/--sbom disabled: Lambda's container runtime rejects the
+# multi-manifest OCI image index that Docker BuildKit adds by default
+docker buildx build --provenance=false --sbom=false --platform linux/amd64 \
+  -t ai-incident-copilot:latest . --load
 
-## Chaos engineering & postmortem
-See [docs/postmortem-chaos-day4.md](./docs/postmortem-chaos-day4.md) for the
-full writeup, including timeline, evidence screenshots, and action items —
-including a real gap found in SLO alert coverage (latency wasn't being
-monitored, only error rate).
+aws ecr get-login-password --region ap-south-1 | \
+  docker login --username AWS --password-stdin <account-id>.dkr.ecr.ap-south-1.ama
+  
+docker tag ai-incident-copilot:latest <account-id>.dkr.ecr.ap-south-1.amazonaws.com/ai-incident-copilot:latest
+docker push <account-id>.dkr.ecr.ap-south-1.amazonaws.com/ai-incident-copilot:latest
 
-## Setup instructions
-1. `terraform apply` in the `sre-platform` repo — provisions VPC, EC2,
-   Elastic IP, and S3 backend for remote state.
-2. k3s is bootstrapped via `user_data.sh` on instance launch.
-3. SSH into the instance, install ArgoCD, point it at the
-   `sre-platform-manifests` repo's `base/` path with auto-sync enabled.
-4. Install the monitoring stack:
-   `helm install monitoring prometheus-community/kube-prometheus-stack -n monitoring --create-namespace`
-5. Push to `main` in `sre-platform-app` → GitHub Actions builds and pushes
-   the image → bumps the tag in `sre-platform-manifests` → ArgoCD detects
-   the Git change and deploys. CI never touches the cluster directly.
+# 3. Deploy infra with Terraform
+cd infra
+terraform init
+terraform apply   # NOTE: type the full word "yes" at the prompt — a bare "y" is treated as "no"
+# Terraform pins the Lambda to the image's immutable ECR digest — pushing a
+# new image alone does NOT update the live Lambda; re-run terraform apply
+# to pick up the new digest.
 
-## Cost breakdown (ap-south-1, approximate)
-| Resource | Running 24/7 | Stopped when not demoing |
-|---|---|---|
-| EC2 t3.medium | ~$33/month | $0 compute |
-| EBS volume | ~$2.40/month (30GB) | same, persists regardless |
-| Elastic IP (attached to running instance) | Free | N/A |
-| Elastic IP (attached to stopped instance) | — | ~$3.65/month (AWS bills idle/stopped-instance EIPs) |
-| S3 (tf state) | Negligible | same |
+# 4. Wire Alertmanager to call it (values live in the monitoring namespace)
+helm get values monitoring -n monitoring -o yaml > current-alertmanager-values.yaml
+# edit current-alertmanager-values.yaml to add:
+#
+# receivers:
+#   - name: ai-copilot
+#     webhook_configs:
+#       - url:
+#         send_resolved: false
+#
+# route:
+#   receiver: slack-notifications
+#   routes:
+#      - matchers: [alertname = "HighErrorBudgetBurn"]
+#       receiver: ai-copilot
+#       continue: true
+#     - matchers: [alertname = "HighErrorBudgetBurn"]
+#       receiver: slack-notifications
+#       continue: true
+#
+# (two sibling routes are required — a matched child route does NOT also
+# fall back to the parent's default receiver, even with continue: true)
 
-Realistic monthly cost for occasional demos with the instance stopped
-between sessions: roughly **$5-10/month**.
+helm upgrade monitoring prometheus-community/kube-prometheus-stack -n monitoring \
+  -f current-alertmanager-values.yaml --reuse-values
 
-## Design tradeoffs (worth reading before an interview)
-- **Single-node k3s cluster instead of multi-node HA** — deliberate cost
-  decision. This means a node-level failure (or, as found during chaos
-  testing, any CPU-heavy workload on the node) affects every component
-  sharing it, since there's no second node to isolate or redistribute load
-  onto. See the postmortem for the full finding.
-- **3-repo GitOps split** (infra / app / manifests) instead of a monorepo —
-  mirrors how CI (build+push) and CD (Argo sync) stay decoupled in real
-  GitOps setups; CI never touches the cluster directly.
+# 5. Verify end-to-end
+# Isolated test:
+curl -X POST https://dfp5rlyggb.execute-api.ap-south-1.amazonaws.com/alert \
+  -H "Content-Type: application/json" \
+  -d @test-event.json
 
+# Real trigger (via Project 1's chaos test): temporarily disable ArgoCD
+# auto-sync so a manual chaos image change isn't reverted mid-test
+kubectl patch application sre-platform-app -n argocd --type merge \
+  -p '{"spec":{"syncPolicy":null}}'
+
+kubectl set image deployment/service-b service-b=tamal23/service-b:v2-chaos-test -n sre-platform
+# ... generate load against /greet for several minutes (1-hour burn-rate
+# window means a brief blip won't cross the 14.4% threshold) ...
+
+# Cleanup after the alert has fired and been confirmed in Slack:
+kubectl set image deployment/service-b service-b=tamal23/service-b:v3-stable -n sre-platform
+kubectl patch application sre-platform-app -n argocd --type merge \
+  -p '{"spec":{"syncPolicy":{"automated":{"prune":true,"selfHeal":true}}}}'
+
+
+## Teardown & Cost — ai-incident-copilot
+
+- Lambda (container image): billed per invocation + duration only, no idle
+  cost. Free tier covers this project's usage easily.
+- ECR: small per-GB/month storage charge for the image (~tens of MB) — negligible.
+- API Gateway HTTP API: $1.00 per million requests — effectively $0 at
+  portfolio-demo volume.
+- Gemini API: free tier (Google AI Studio) — $0.
+- **Total marginal cost for this project: effectively $0**, by deliberate
+  design — avoided Bedrock and OpenSearch Serverless specifically to keep
+  this true.
+
+\`\`\`bash
+# Full teardown when done for good
+cd infra
+terraform destroy
+aws ecr batch-delete-image --repository-name ai-incident-copilot --image-ids imageTag=latest
+\`\`\`
