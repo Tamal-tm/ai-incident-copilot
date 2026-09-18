@@ -1,4 +1,4 @@
-\`\`\`mermaid
+\`\`\`
 flowchart LR
     AM["Alertmanager<br/>(receiver: ai-copilot)"] -->|POST /alert<br/>webhook_configs| APIGW["API Gateway HTTP API<br/>>
     APIGW --> LAMBDA["Lambda (container image, ECR)<br/>handler.py — filters status=='firing'"]
