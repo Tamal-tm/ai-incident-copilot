@@ -8,6 +8,18 @@ flowchart LR
     LAMBDA -->|post message| SLACK2["Slack #alerts"]
 \`\`\`
 
+## Alert → AI Copilot Flow
+
+```mermaid
+flowchart LR
+    AM["Alertmanager<br/>(receiver: ai-copilot)"] -->|POST /alert<br/>webhook_configs| APIGW["API Gateway HTTP API"]
+    APIGW --> LAMBDA["Lambda (container image, ECR)<br/>handler.py — filters status=='firing'"]
+    LAMBDA -->|similarity_search k=2| FAISS["FAISS index<br/>baked into image at build time"]
+    LAMBDA -->|prompt + runbook context,<br/>retry x3 w/ backoff| GEMINI["Gemini 2.5/3.6 Flash"]
+    GEMINI -->|diagnosis text| LAMBDA
+    LAMBDA -->|post message| SLACK2["Slack #alerts"]
+
+
 
 # Prerequisites: AWS account, Terraform >= 1.5, Docker 23+ (BuildKit),
 # AWS CLI, Gemini API key (Google AI Studio free tier), Slack incoming webhook URL
