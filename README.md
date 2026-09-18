@@ -9,7 +9,8 @@ flowchart LR
     GEMINI -->|diagnosis text| LAMBDA
     LAMBDA -->|post message| SLACK2["Slack #alerts"]
 ```
-
+> Part of a 4-repo GitOps setup. See [sre-platform](https://github.com/Tamal-tm/sre-platform)
+> for the full architecture, infra setup, and end-to-end demo.
 
 
 ```markdown
