@@ -8,7 +8,7 @@ flowchart LR
     LAMBDA -->|prompt + runbook context,<br/>retry x3 w/ backoff| GEMINI["Gemini 2.5/3.6 Flash"]
     GEMINI -->|diagnosis text| LAMBDA
     LAMBDA -->|post message| SLACK2["Slack #alerts"]
-
+```
 
 # Prerequisites: AWS account, Terraform >= 1.5, Docker 23+ (BuildKit),
 # AWS CLI, Gemini API key (Google AI Studio free tier), Slack incoming webhook URL
